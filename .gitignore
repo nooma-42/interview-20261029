@@ -1,0 +1,5 @@
+/bin/
+/artifacts/
+*.log
+.env
+.DS_Store
