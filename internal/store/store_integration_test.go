@@ -120,35 +120,80 @@ func get(t *testing.T, db *store.Store, channel string) domain.Rocket {
 	}
 	return r
 }
+func replay(t *testing.T, db *store.Store) store.ReplayResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := db.ProcessNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+func drain(t *testing.T, db *store.Store) {
+	t.Helper()
+	for replay(t, db).Channel != "" {
+	}
+}
+func startReplay(t *testing.T, db *store.Store) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		db.RunReplay(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), func(int64) {})
+	}()
+	return func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("replay did not stop")
+		}
+	}
+}
+func awaitApplied(t *testing.T, db *store.Store, channel string, last int64) domain.Rocket {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r := get(t, db, channel)
+		if r.LastApplied == last {
+			return r
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replay did not reach %d: %+v", last, r)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 func TestSequenceHTTPAndDeduplication(t *testing.T) {
 	db, _ := database(t)
 	s := api(t, db)
 	cases := []struct {
-		n             int64
-		status        int
-		last, pending int64
-	}{{1, 200, 1, 0}, {3, 202, 1, 1}, {4, 202, 1, 2}, {2, 200, 4, 0}}
+		n, last int64
+	}{{1, 1}, {3, 1}, {4, 1}, {2, 4}}
 	for _, c := range cases {
 		body := speed("a", c.n)
 		if c.n == 1 {
 			body = launch("a")
 		}
-		result := post(t, s.URL, body, c.status)
-		if result.LastApplied != c.last || result.Pending != c.pending {
-			t.Fatalf("%+v", result)
+		post(t, s.URL, body, 202)
+		drain(t, db)
+		if r := get(t, db, "a"); r.LastApplied != c.last {
+			t.Fatalf("%+v", r)
 		}
 	}
 	r := get(t, db, "a")
-	if *r.Speed != 103 || r.LastApplied != 4 || r.Pending != 0 || r.MaxReceived != 4 {
+	if *r.Speed != 103 || r.LastApplied != 4 {
 		t.Fatalf("%+v", r)
 	}
-	if result := post(t, s.URL, speed("a", 2), 200); !result.Duplicate || result.Applied != 0 {
+	if result := post(t, s.URL, speed("a", 2), 202); !result.Duplicate {
 		t.Fatal(result)
 	}
 	post(t, s.URL, strings.Replace(speed("a", 2), `"by":1`, `"by":99`, 1), 409)
 	post(t, s.URL, strings.Replace(speed("a", 2), "123Z", "124Z", 1), 409)
 	post(t, s.URL, speed("a", 8), 202)
-	if result := post(t, s.URL, speed("a", 8), 202); !result.Duplicate || result.Pending != 1 {
+	if result := post(t, s.URL, speed("a", 8), 202); !result.Duplicate {
 		t.Fatal(result)
 	}
 	var count int
@@ -164,6 +209,77 @@ func TestSequenceHTTPAndDeduplication(t *testing.T) {
 		t.Fatal(resp.Status)
 	}
 }
+
+type receiveQueries struct {
+	replays, updates, lockedReads atomic.Int64
+}
+
+func (q *receiveQueries) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.HasPrefix(data.SQL, "SELECT message_number,payload") {
+		q.replays.Add(1)
+	}
+	if strings.HasPrefix(data.SQL, "UPDATE rockets") {
+		q.updates.Add(1)
+	}
+	if strings.Contains(data.SQL, "FOR UPDATE") {
+		q.lockedReads.Add(1)
+	}
+	return ctx
+}
+
+func (*receiveQueries) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func TestReceiveFastPaths(t *testing.T) {
+	db, _ := database(t)
+	queries := &receiveQueries{}
+	cfg := db.Pool.Config()
+	cfg.ConnConfig.Tracer = queries
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	traced := &store.Store{Pool: pool}
+	for _, c := range []struct {
+		name, body string
+		duplicate  bool
+	}{
+		{"launch", launch("fast"), false},
+		{"pending", speed("fast", 3), false},
+		{"pending duplicate", speed("fast", 3), true},
+		{"more pending", speed("fast", 4), false},
+		{"launch duplicate", launch("fast"), true},
+		{"gap filled", speed("fast", 2), false},
+		{"in order", speed("fast", 5), false},
+		{"duplicate", speed("fast", 5), true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			queries.replays.Store(0)
+			queries.updates.Store(0)
+			queries.lockedReads.Store(0)
+			event, err := domain.Parse([]byte(c.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := traced.Receive(context.Background(), event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Channel != "fast" || result.Duplicate != c.duplicate {
+				t.Fatalf("unexpected result: %+v", result)
+			}
+			if queries.replays.Load() != 0 || queries.updates.Load() != 0 || queries.lockedReads.Load() != 0 {
+				t.Fatal("receive read or changed replay state")
+			}
+		})
+	}
+	drain(t, db)
+	r := get(t, db, "fast")
+	if r.Speed == nil || *r.Speed != 104 || r.LastApplied != 5 {
+		t.Fatalf("unexpected snapshot: %+v", r)
+	}
+}
+
 func TestLateLaunchMultipleGapsAndRestart(t *testing.T) {
 	db, connection := database(t)
 	s := api(t, db)
@@ -171,7 +287,7 @@ func TestLateLaunchMultipleGapsAndRestart(t *testing.T) {
 		post(t, s.URL, speed("late", n), 202)
 	}
 	r := get(t, db, "late")
-	if r.Status != "awaiting_launch" || r.Type != nil || r.Speed != nil || r.Mission != nil || r.LastMessageTime != nil || r.Pending != 3 {
+	if r.Status != "awaiting_launch" || r.Type != nil || r.Speed != nil || r.Mission != nil || r.LastMessageTime != nil {
 		t.Fatal(r)
 	}
 	s.Close()
@@ -182,14 +298,15 @@ func TestLateLaunchMultipleGapsAndRestart(t *testing.T) {
 	}
 	defer reopened.Pool.Close()
 	s = api(t, reopened)
-	for _, c := range []struct{ n, last, pending int64 }{{1, 2, 2}, {3, 4, 1}, {5, 6, 0}} {
+	for _, c := range []struct{ n, last int64 }{{1, 2}, {3, 4}, {5, 6}} {
 		body := speed("late", c.n)
 		if c.n == 1 {
 			body = launch("late")
 		}
-		result := post(t, s.URL, body, 200)
-		if result.LastApplied != c.last || result.Pending != c.pending {
-			t.Fatal(result)
+		post(t, s.URL, body, 202)
+		drain(t, reopened)
+		if r := get(t, reopened, "late"); r.LastApplied != c.last {
+			t.Fatal(r)
 		}
 	}
 	if r = get(t, reopened, "late"); *r.Speed != 105 {
@@ -203,6 +320,8 @@ func TestTwoInstancesConcurrentAndAtomicReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Pool.Close()
+	defer startReplay(t, db)()
+	defer startReplay(t, second)()
 	servers := []*httptest.Server{api(t, db), api(t, second)}
 	const rockets = 8
 	const events = 70
@@ -258,7 +377,7 @@ func TestTwoInstancesConcurrentAndAtomicReads(t *testing.T) {
 				}
 				_, _ = io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
-				if resp.StatusCode != 200 && resp.StatusCode != 202 {
+				if resp.StatusCode != 202 {
 					errs <- fmt.Errorf("status %d", resp.StatusCode)
 				}
 			}
@@ -276,34 +395,142 @@ func TestTwoInstancesConcurrentAndAtomicReads(t *testing.T) {
 		t.Error(err)
 	}
 	for i := 0; i < rockets; i++ {
-		r := get(t, db, fmt.Sprintf("c%02d", i))
-		if r.LastApplied != events || r.Pending != 0 || *r.Speed != 99+events || r.ReceivedCount != events {
+		r := awaitApplied(t, db, fmt.Sprintf("c%02d", i), events)
+		if r.LastApplied != events || *r.Speed != 99+events {
 			t.Fatal(r)
 		}
 	}
-	n, err := db.PendingCount(context.Background())
-	if err != nil || n != 0 {
-		t.Fatal(n, err)
+}
+
+func TestReceiveWhileReplayRowLocked(t *testing.T) {
+	db, _ := database(t)
+	post(t, api(t, db).URL, launch("parallel"), 202)
+	tx, err := db.Pool.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(context.Background(), `SELECT channel FROM rockets WHERE channel='parallel' FOR NO KEY UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, number := range []int64{2, 3} {
+		wg.Add(1)
+		go func(number int64) {
+			defer wg.Done()
+			event, err := domain.Parse([]byte(speed("parallel", number)))
+			if err == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_, err = db.Receive(ctx, event)
+			}
+			errs <- err
+		}(number)
+	}
+	completed := make(chan struct{})
+	go func() { wg.Wait(); close(completed) }()
+	select {
+	case <-completed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("receive blocked on replay row lock")
+	}
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, db)
+	if r := get(t, db, "parallel"); r.LastApplied != 3 || *r.Speed != 102 {
+		t.Fatal(r)
 	}
 }
-func TestRollbackOnUpdateAndCommitFailure(t *testing.T) {
+
+func TestConcurrentSameKey(t *testing.T) {
+	db, _ := database(t)
+	post(t, api(t, db).URL, launch("same"), 202)
+	bodies := []string{speed("same", 2), strings.Replace(speed("same", 2), `"by":1`, `"by":2`, 1)}
+	results := make(chan struct {
+		result store.Result
+		err    error
+	}, 2)
+	start := make(chan struct{})
+	for _, body := range bodies {
+		go func(body string) {
+			<-start
+			event, err := domain.Parse([]byte(body))
+			if err != nil {
+				results <- struct {
+					result store.Result
+					err    error
+				}{err: err}
+				return
+			}
+			result, err := db.Receive(context.Background(), event)
+			results <- struct {
+				result store.Result
+				err    error
+			}{result, err}
+		}(body)
+	}
+	close(start)
+	a, b := <-results, <-results
+	if a.err == nil && b.err == nil || a.err != nil && b.err != nil {
+		t.Fatalf("same key must have one winner: %v, %v", a.err, b.err)
+	}
+	loser := a.err
+	if loser == nil {
+		loser = b.err
+	}
+	if loser != store.ErrConflict {
+		t.Fatal(loser)
+	}
+	var count int
+	if err := db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM rocket_events WHERE channel='same' AND message_number=2`).Scan(&count); err != nil || count != 1 {
+		t.Fatal(count, err)
+	}
+	// Concurrent identical retries must both succeed and report one duplicate.
+	event, err := domain.Parse([]byte(speed("same", 3)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		go func() {
+			result, err := db.Receive(context.Background(), event)
+			results <- struct {
+				result store.Result
+				err    error
+			}{result, err}
+		}()
+	}
+	a, b = <-results, <-results
+	if a.err != nil || b.err != nil || a.result.Duplicate == b.result.Duplicate {
+		t.Fatalf("identical retries: %+v, %+v", a, b)
+	}
+}
+func TestRollbackOnInsertAndCommitFailure(t *testing.T) {
 	for _, deferred := range []bool{false, true} {
 		t.Run(fmt.Sprint(deferred), func(t *testing.T) {
 			db, _ := database(t)
 			s := api(t, db)
-			post(t, s.URL, launch("a"), 200)
+			post(t, s.URL, launch("a"), 202)
+			drain(t, db)
 			sql := `CREATE FUNCTION reject_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected write failure'; END $$;`
 			if deferred {
 				sql += `CREATE CONSTRAINT TRIGGER injected_failure AFTER INSERT ON rocket_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_change()`
 			} else {
-				sql += `CREATE TRIGGER injected_failure BEFORE UPDATE ON rockets FOR EACH ROW EXECUTE FUNCTION reject_change()`
+				sql += `CREATE TRIGGER injected_failure BEFORE INSERT ON rocket_events FOR EACH ROW EXECUTE FUNCTION reject_change()`
 			}
 			if _, err := db.Pool.Exec(context.Background(), sql); err != nil {
 				t.Fatal(err)
 			}
 			post(t, s.URL, speed("a", 2), 503)
 			r := get(t, db, "a")
-			if r.LastApplied != 1 || *r.Speed != 100 || r.ReceivedCount != 1 {
+			if r.LastApplied != 1 || *r.Speed != 100 {
 				t.Fatal(r)
 			}
 			var count int
@@ -311,38 +538,58 @@ func TestRollbackOnUpdateAndCommitFailure(t *testing.T) {
 			if count != 1 {
 				t.Fatal("event escaped rollback", count)
 			}
-			table := "rockets"
-			if deferred {
-				table = "rocket_events"
-			}
-			if _, err := db.Pool.Exec(context.Background(), `DROP TRIGGER injected_failure ON `+table); err != nil {
+			if _, err := db.Pool.Exec(context.Background(), `DROP TRIGGER injected_failure ON rocket_events`); err != nil {
 				t.Fatal(err)
 			}
-			post(t, s.URL, speed("a", 2), 200)
+			post(t, s.URL, speed("a", 2), 202)
+			drain(t, db)
 			if r = get(t, db, "a"); *r.Speed != 101 || r.LastApplied != 2 {
 				t.Fatal(r)
 			}
 		})
 	}
 }
-func TestOverflowRollsBackGapFillingRequest(t *testing.T) {
+func TestOverflowBlocksOnlyItsChannel(t *testing.T) {
 	db, _ := database(t)
 	s := api(t, db)
-	post(t, s.URL, strings.Replace(launch("a"), `"launchSpeed":100`, fmt.Sprintf(`"launchSpeed":%d`, int64(math.MaxInt64)), 1), 200)
+	post(t, s.URL, strings.Replace(launch("a"), `"launchSpeed":100`, fmt.Sprintf(`"launchSpeed":%d`, int64(math.MaxInt64)), 1), 202)
+	drain(t, db)
 	post(t, s.URL, speed("a", 3), 202)
-	post(t, s.URL, message("a", 2, domain.MissionChanged, `{"newMission":"changed"}`), 422)
+	post(t, s.URL, message("a", 2, domain.MissionChanged, `{"newMission":"changed"}`), 202)
+	result := replay(t, db)
+	if result.Applied != 1 || result.Blocked == nil {
+		t.Fatal(result)
+	}
 	r := get(t, db, "a")
-	if r.LastApplied != 1 || r.ReceivedCount != 2 || *r.Mission != "m" || *r.Speed != math.MaxInt64 {
+	if r.LastApplied != 2 || *r.Mission != "changed" || r.ReplayError == nil || !strings.Contains(*r.ReplayError, "messageNumber 3") {
 		t.Fatal(r)
+	}
+	// New arrivals and duplicates do not reset the poison-event cooldown.
+	post(t, s.URL, speed("a", 4), 202)
+	post(t, s.URL, speed("a", 3), 202)
+	post(t, s.URL, launch("b"), 202)
+	if result = replay(t, db); result.Channel != "b" || result.Applied != 1 {
+		t.Fatal(result)
+	}
+	if result = replay(t, db); result.Channel != "" {
+		t.Fatal("blocked channel retried too early", result)
+	}
+	if _, err := db.Pool.Exec(context.Background(), `UPDATE rockets SET replay_after='-infinity' WHERE channel='a'`); err != nil {
+		t.Fatal(err)
+	}
+	if result = replay(t, db); result.Blocked == nil || result.Applied != 0 {
+		t.Fatal(result)
 	}
 }
 func TestSortPaginationAndNulls(t *testing.T) {
 	db, _ := database(t)
 	s := api(t, db)
-	post(t, s.URL, launch("b"), 200)
-	post(t, s.URL, launch("a"), 200)
+	post(t, s.URL, launch("b"), 202)
+	post(t, s.URL, launch("a"), 202)
+	drain(t, db)
 	post(t, s.URL, speed("c", 2), 202)
-	post(t, s.URL, speed("b", 2), 200)
+	post(t, s.URL, speed("b", 2), 202)
+	drain(t, db)
 	for _, c := range []struct{ sort, order, want string }{{"channel", "asc", "abc"}, {"channel", "desc", "cba"}, {"speed", "asc", "abc"}, {"speed", "desc", "bac"}, {"mission", "desc", "abc"}, {"lastMessageTime", "asc", "bac"}, {"lastMessageTime", "desc", "abc"}} {
 		resp, err := http.Get(s.URL + "/rockets?sort=" + c.sort + "&order=" + c.order)
 		if err != nil {
@@ -375,19 +622,104 @@ func TestSortPaginationAndNulls(t *testing.T) {
 	}
 }
 
-func TestReplayAcrossFetchBatches(t *testing.T) {
-	db, _ := database(t)
+func TestReplayBatchesResumeAfterRestartWithoutNewMessages(t *testing.T) {
+	db, connection := database(t)
 	s := api(t, db)
 	const total = 520
 	for n := int64(total); n >= 2; n-- {
 		post(t, s.URL, speed("batch", n), 202)
 	}
-	result := post(t, s.URL, launch("batch"), 200)
-	if result.LastApplied != total || result.Pending != 0 {
+	if result := replay(t, db); result.Channel != "" {
+		t.Fatal("gap should not be runnable", result)
+	}
+	post(t, s.URL, launch("batch"), 202)
+	if result := replay(t, db); result.Applied != store.ReplayBatchSize {
 		t.Fatal(result)
 	}
-	if r := get(t, db, "batch"); *r.Speed != 99+total {
+	if r := get(t, db, "batch"); r.LastApplied != store.ReplayBatchSize {
 		t.Fatal(r)
+	}
+	s.Close()
+	db.Pool.Close()
+	reopened, err := store.Open(context.Background(), connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Pool.Close()
+	defer startReplay(t, reopened)()
+	if r := awaitApplied(t, reopened, "batch", total); *r.Speed != 99+total {
+		t.Fatal(r)
+	}
+}
+
+func TestReplaySkipsLockedChannelsAndRotatesBatches(t *testing.T) {
+	db, _ := database(t)
+	s := api(t, db)
+	post(t, s.URL, launch("a"), 202)
+	post(t, s.URL, launch("b"), 202)
+	for n := int64(2); n <= store.ReplayBatchSize+1; n++ {
+		post(t, s.URL, speed("a", n), 202)
+	}
+	tx, err := db.Pool.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err = tx.Exec(context.Background(), `SELECT channel FROM rockets WHERE channel='a' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	if result := replay(t, db); result.Channel != "b" {
+		t.Fatal(result)
+	}
+	if err = tx.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if result := replay(t, db); result.Channel != "a" || result.Applied != store.ReplayBatchSize {
+		t.Fatal(result)
+	}
+	post(t, s.URL, launch("c"), 202)
+	if result := replay(t, db); result.Channel != "c" {
+		t.Fatal("hot channel starved a new channel", result)
+	}
+	drain(t, db)
+}
+
+func TestReplayRollbackPreservesEarlierBatches(t *testing.T) {
+	for _, deferred := range []bool{false, true} {
+		t.Run(fmt.Sprint(deferred), func(t *testing.T) {
+			db, _ := database(t)
+			s := api(t, db)
+			post(t, s.URL, launch("a"), 202)
+			const total = store.ReplayBatchSize + 2
+			for n := int64(2); n <= total; n++ {
+				post(t, s.URL, speed("a", n), 202)
+			}
+			if result := replay(t, db); result.Applied != store.ReplayBatchSize {
+				t.Fatal(result)
+			}
+			sql := `CREATE FUNCTION reject_replay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected replay failure'; END $$;`
+			if deferred {
+				sql += `CREATE CONSTRAINT TRIGGER injected_failure AFTER UPDATE ON rockets DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_replay()`
+			} else {
+				sql += `CREATE TRIGGER injected_failure BEFORE UPDATE ON rockets FOR EACH ROW EXECUTE FUNCTION reject_replay()`
+			}
+			if _, err := db.Pool.Exec(context.Background(), sql); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ProcessNext(context.Background()); err == nil {
+				t.Fatal("expected replay failure")
+			}
+			if r := get(t, db, "a"); r.LastApplied != store.ReplayBatchSize || *r.Speed != 99+store.ReplayBatchSize {
+				t.Fatal(r)
+			}
+			if _, err := db.Pool.Exec(context.Background(), `DROP TRIGGER injected_failure ON rockets`); err != nil {
+				t.Fatal(err)
+			}
+			drain(t, db)
+			if r := get(t, db, "a"); r.LastApplied != total || *r.Speed != 99+total {
+				t.Fatal(r)
+			}
+		})
 	}
 }
 
@@ -401,5 +733,22 @@ func TestReadinessRequiresMigrations(t *testing.T) {
 	}
 	if err := db.Ready(context.Background()); err == nil {
 		t.Fatal("ready with missing migration record")
+	}
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO schema_migrations(version) VALUES ('other.sql')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ready(context.Background()); err == nil {
+		t.Fatal("ready with wrong migration record")
+	}
+}
+
+func TestReplayCheckpointAtMaxInt64(t *testing.T) {
+	db, _ := database(t)
+	post(t, api(t, db).URL, launch("max"), 202)
+	if _, err := db.Pool.Exec(context.Background(), `UPDATE rockets SET last_applied=$1 WHERE channel='max'`, int64(math.MaxInt64)); err != nil {
+		t.Fatal(err)
+	}
+	if result := replay(t, db); result.Channel != "" {
+		t.Fatal(result)
 	}
 }

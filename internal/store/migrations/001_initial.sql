@@ -7,8 +7,8 @@ CREATE TABLE rockets (
  explosion_reason text,
  last_message_time timestamptz,
  last_applied bigint NOT NULL DEFAULT 0 CHECK (last_applied >= 0),
- max_received bigint NOT NULL DEFAULT 0 CHECK (max_received >= last_applied),
- received_count bigint NOT NULL DEFAULT 0 CHECK (received_count >= last_applied)
+ replay_after timestamptz NOT NULL DEFAULT '-infinity',
+ replay_error text
 );
 CREATE TABLE rocket_events (
  channel text NOT NULL REFERENCES rockets(channel),

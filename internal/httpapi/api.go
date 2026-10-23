@@ -25,7 +25,6 @@ type Repository interface {
 	Get(context.Context, string) (domain.Rocket, error)
 	List(context.Context, store.ListOptions) ([]domain.Rocket, error)
 	Ready(context.Context) error
-	PendingCount(context.Context) (int64, error)
 }
 
 type API struct {
@@ -38,13 +37,13 @@ type API struct {
 }
 
 // New owns its registry, allowing independent API instances in tests and one process.
-func New(repo Repository, logger *slog.Logger) http.Handler {
+func New(repo Repository, logger *slog.Logger) *API {
 	a := &API{repo: repo, logger: logger, mux: http.NewServeMux()}
 	reg := prometheus.NewRegistry()
 	a.events = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "rocket_events_received_total", Help: "Ingestion requests by durable outcome."}, []string{"outcome"})
 	a.applied = prometheus.NewCounter(prometheus.CounterOpts{Name: "rocket_events_applied_total", Help: "Events applied by this instance after successful commit."})
 	a.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "rocket_http_request_duration_seconds", Help: "HTTP latency by route, method and status.", Buckets: prometheus.DefBuckets}, []string{"route", "method", "status"})
-	reg.MustRegister(a.events, a.applied, a.latency, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}), &pendingCollector{repo: repo})
+	reg.MustRegister(a.events, a.applied, a.latency, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	a.handle("/messages", http.MethodPost, a.receive)
 	a.handle("/rockets", http.MethodGet, a.list)
 	a.handle("/rockets/{channel}", http.MethodGet, a.get)
@@ -53,22 +52,27 @@ func New(repo Repository, logger *slog.Logger) http.Handler {
 	metrics := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	a.handle("/metrics", http.MethodGet, metrics.ServeHTTP)
 	a.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { fail(w, 404, "not_found", "endpoint not found") })
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rec := &recorder{ResponseWriter: w, status: 200}
-		a.mux.ServeHTTP(rec, r)
-		route := r.Pattern
-		if route == "" {
-			route = "/"
-		}
-		method := r.Method
-		switch method {
-		case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS":
-		default:
-			method = "OTHER"
-		}
-		a.latency.WithLabelValues(route, method, strconv.Itoa(rec.status)).Observe(time.Since(start).Seconds())
-	})
+	return a
+}
+
+// EventsApplied records only batches whose commit was acknowledged.
+func (a *API) EventsApplied(n int64) { a.applied.Add(float64(n)) }
+
+func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rec := &recorder{ResponseWriter: w, status: 200}
+	a.mux.ServeHTTP(rec, r)
+	route := r.Pattern
+	if route == "" {
+		route = "/"
+	}
+	method := r.Method
+	switch method {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS":
+	default:
+		method = "OTHER"
+	}
+	a.latency.WithLabelValues(route, method, strconv.Itoa(rec.status)).Observe(time.Since(start).Seconds())
 }
 
 type recorder struct {
@@ -128,27 +132,18 @@ func (a *API) receive(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, store.ErrConflict):
 			a.events.WithLabelValues("conflict").Inc()
 			fail(w, 409, "message_conflict", err.Error())
-		case errors.Is(err, domain.ErrOverflow):
-			a.events.WithLabelValues("overflow").Inc()
-			fail(w, 422, "speed_overflow", err.Error())
 		default:
 			a.events.WithLabelValues("unavailable").Inc()
 			a.unavailable(w, err)
 		}
 		return
 	}
-	a.applied.Add(float64(result.Applied))
-	outcome := "applied"
-	status := http.StatusOK
-	if event.Metadata.Number > result.LastApplied {
-		outcome = "pending"
-		status = http.StatusAccepted
-	}
+	outcome := "stored"
 	if result.Duplicate {
 		outcome = "duplicate"
 	}
 	a.events.WithLabelValues(outcome).Inc()
-	write(w, status, result)
+	write(w, http.StatusAccepted, result)
 }
 func (a *API) get(w http.ResponseWriter, r *http.Request) {
 	result, err := a.repo.Get(r.Context(), r.PathValue("channel"))
@@ -215,24 +210,4 @@ func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, 200, map[string]string{"status": "ready"})
-}
-
-// The gauge reads committed database state at scrape time, so it remains correct
-// across restarts and multiple instances. Do not sum this gauge across replicas.
-type pendingCollector struct{ repo Repository }
-
-var pendingDesc = prometheus.NewDesc("rocket_pending_events", "Committed events waiting for missing sequence numbers across the database.", nil, nil)
-var scrapeDesc = prometheus.NewDesc("rocket_pending_scrape_success", "Whether pending event collection succeeded.", nil, nil)
-
-func (c *pendingCollector) Describe(ch chan<- *prometheus.Desc) { ch <- pendingDesc; ch <- scrapeDesc }
-func (c *pendingCollector) Collect(ch chan<- prometheus.Metric) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	n, err := c.repo.PendingCount(ctx)
-	success := 0.0
-	if err == nil {
-		success = 1
-		ch <- prometheus.MustNewConstMetric(pendingDesc, prometheus.GaugeValue, float64(n))
-	}
-	ch <- prometheus.MustNewConstMetric(scrapeDesc, prometheus.GaugeValue, success)
 }

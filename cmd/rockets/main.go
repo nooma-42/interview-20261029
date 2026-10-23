@@ -68,7 +68,15 @@ func run(logger *slog.Logger) error {
 	if err = db.Ready(startup); err != nil {
 		return fmt.Errorf("run rockets migrate first: %w", err)
 	}
-	server := &http.Server{Addr: env("HTTP_ADDR", ":8088"), Handler: httpapi.New(db, logger), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	api := httpapi.New(db, logger)
+	replayCtx, stopReplay := context.WithCancel(ctx)
+	replayDone := make(chan struct{})
+	go func() {
+		defer close(replayDone)
+		db.RunReplay(replayCtx, logger, api.EventsApplied)
+	}()
+	defer func() { stopReplay(); <-replayDone }()
+	server := &http.Server{Addr: env("HTTP_ADDR", ":8088"), Handler: api, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	result := make(chan error, 1)
 	go func() { logger.Info("listening", "address", server.Addr); result <- server.ListenAndServe() }()
 	select {

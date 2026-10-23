@@ -2,14 +2,14 @@ services:
   db:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: rockets
-      POSTGRES_PASSWORD: rockets
-      POSTGRES_DB: rockets
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
       POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: [CMD-SHELL, pg_isready -U rockets -d rockets]
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
       interval: 2s
       timeout: 3s
       retries: 30
@@ -17,8 +17,11 @@ services:
     build: .
     image: lunar-rockets:local
     command: [migrate]
-    environment:
-      DATABASE_URL: postgres://rockets:rockets@db:5432/rockets?sslmode=disable
+    environment: &app-database
+      DATABASE_URL: postgres://db:5432/?sslmode=disable
+      PGUSER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGDATABASE: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
     depends_on:
       db:
         condition: service_healthy
@@ -28,8 +31,7 @@ services:
     ports:
       - 127.0.0.1:8088:8088
       - "[::1]:8088:8088"
-    environment:
-      DATABASE_URL: postgres://rockets:rockets@db:5432/rockets?sslmode=disable
+    environment: *app-database
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -5,7 +5,6 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -112,12 +111,11 @@ func (s *Store) Ready(ctx context.Context) error {
 	return nil
 }
 
-const columns = `channel, rocket_type, speed, mission, status, explosion_reason, last_message_time, last_applied, max_received, received_count`
+const columns = `channel, rocket_type, speed, mission, status, explosion_reason, last_message_time, last_applied, replay_error`
 
 func scan(row pgx.Row) (domain.Rocket, error) {
 	var r domain.Rocket
-	err := row.Scan(&r.Channel, &r.Type, &r.Speed, &r.Mission, &r.Status, &r.ExplosionReason, &r.LastMessageTime, &r.LastApplied, &r.MaxReceived, &r.ReceivedCount)
-	r.Pending = r.ReceivedCount - r.LastApplied
+	err := row.Scan(&r.Channel, &r.Type, &r.Speed, &r.Mission, &r.Status, &r.ExplosionReason, &r.LastMessageTime, &r.LastApplied, &r.ReplayError)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -125,11 +123,8 @@ func scan(row pgx.Row) (domain.Rocket, error) {
 }
 
 type Result struct {
-	Channel     string `json:"channel"`
-	LastApplied int64  `json:"lastAppliedMessageNumber"`
-	Pending     int64  `json:"pendingMessageCount"`
-	Duplicate   bool   `json:"duplicate"`
-	Applied     int64  `json:"-"`
+	Channel   string `json:"channel"`
+	Duplicate bool   `json:"duplicate"`
 }
 
 func (s *Store) Receive(ctx context.Context, e domain.Event) (Result, error) {
@@ -142,11 +137,6 @@ func (s *Store) Receive(ctx context.Context, e domain.Event) (Result, error) {
 	if _, err = tx.Exec(ctx, `INSERT INTO rockets(channel) VALUES($1) ON CONFLICT DO NOTHING`, channel); err != nil {
 		return Result{}, err
 	}
-	r, err := scan(tx.QueryRow(ctx, `SELECT `+columns+` FROM rockets WHERE channel=$1 FOR UPDATE`, channel))
-	if err != nil {
-		return Result{}, err
-	}
-	previous := r.LastApplied
 	data := e.JSON()
 	tag, err := tx.Exec(ctx, `INSERT INTO rocket_events(channel,message_number,event_type,message_time,payload) VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT DO NOTHING`, channel, e.Metadata.Number, e.Metadata.Type, e.Metadata.Time, string(data))
 	if err != nil {
@@ -161,56 +151,15 @@ func (s *Store) Receive(ctx context.Context, e domain.Event) (Result, error) {
 		if !equal {
 			return Result{}, ErrConflict
 		}
-	} else {
-		r.ReceivedCount++
-		r.MaxReceived = max(r.MaxReceived, e.Metadata.Number)
-	}
-	// Bound each fetch. A gap stops replay immediately, even with a large pending backlog.
-	for r.LastApplied < math.MaxInt64 {
-		rows, err := tx.Query(ctx, `SELECT message_number,payload FROM rocket_events WHERE channel=$1 AND message_number>$2 ORDER BY message_number LIMIT 256`, channel, r.LastApplied)
-		if err != nil {
+		if err = tx.Commit(ctx); err != nil {
 			return Result{}, err
 		}
-		applied := 0
-		var replayErr error
-		for rows.Next() {
-			var number int64
-			var raw []byte
-			if replayErr = rows.Scan(&number, &raw); replayErr != nil {
-				break
-			}
-			if number != r.LastApplied+1 {
-				break
-			}
-			var pending domain.Event
-			pending, replayErr = domain.Parse(raw)
-			if replayErr != nil {
-				break
-			}
-			r, replayErr = domain.Apply(r, pending)
-			if replayErr != nil {
-				break
-			}
-			applied++
-		}
-		rows.Close()
-		if replayErr != nil {
-			return Result{}, replayErr
-		}
-		if err = rows.Err(); err != nil {
-			return Result{}, err
-		}
-		if applied < 256 {
-			break
-		}
-	}
-	if _, err = tx.Exec(ctx, `UPDATE rockets SET rocket_type=$2,speed=$3,mission=$4,status=$5,explosion_reason=$6,last_message_time=$7,last_applied=$8,max_received=$9,received_count=$10 WHERE channel=$1`, channel, r.Type, r.Speed, r.Mission, r.Status, r.ExplosionReason, r.LastMessageTime, r.LastApplied, r.MaxReceived, r.ReceivedCount); err != nil {
-		return Result{}, err
+		return Result{Channel: channel, Duplicate: true}, nil
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return Result{}, err
 	}
-	return Result{Channel: channel, LastApplied: r.LastApplied, Pending: r.ReceivedCount - r.LastApplied, Duplicate: duplicate, Applied: r.LastApplied - previous}, nil
+	return Result{Channel: channel}, nil
 }
 
 func (s *Store) Get(ctx context.Context, channel string) (domain.Rocket, error) {
@@ -247,10 +196,4 @@ func (s *Store) List(ctx context.Context, o ListOptions) ([]domain.Rocket, error
 		result = append(result, r)
 	}
 	return result, rows.Err()
-}
-
-func (s *Store) PendingCount(ctx context.Context) (int64, error) {
-	var n int64
-	err := s.Pool.QueryRow(ctx, `SELECT COALESCE(SUM(received_count-last_applied),0)::bigint FROM rockets`).Scan(&n)
-	return n, err
 }

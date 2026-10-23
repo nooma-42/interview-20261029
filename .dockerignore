@@ -4,3 +4,4 @@ docs
 artifacts
 bin
 *.log
+.env

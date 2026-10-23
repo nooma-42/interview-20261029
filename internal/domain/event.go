@@ -154,9 +154,7 @@ type Rocket struct {
 	ExplosionReason *string    `json:"explosionReason"`
 	LastMessageTime *time.Time `json:"lastMessageTime"`
 	LastApplied     int64      `json:"lastAppliedMessageNumber"`
-	MaxReceived     int64      `json:"maxReceivedMessageNumber"`
-	ReceivedCount   int64      `json:"-"`
-	Pending         int64      `json:"pendingMessageCount"`
+	ReplayError     *string    `json:"replayError"`
 }
 
 func NewRocket(channel string) Rocket { return Rocket{Channel: channel, Status: "awaiting_launch"} }
