@@ -403,34 +403,3 @@ func TestReadinessRequiresMigrations(t *testing.T) {
 		t.Fatal("ready with missing migration record")
 	}
 }
-
-func TestMigrationRemovesSortIndexes(t *testing.T) {
-	db, _ := database(t)
-	ctx := context.Background()
-	assertNoSortIndexes := func() {
-		t.Helper()
-		var count int
-		err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN ('rockets_speed_idx','rockets_mission_idx','rockets_time_idx')`).Scan(&count)
-		if err != nil || count != 0 {
-			t.Fatalf("sort indexes remaining: %d, error: %v", count, err)
-		}
-	}
-	assertNoSortIndexes()
-	post(t, api(t, db).URL, launch("existing"), 200)
-	// Recreate the version 001 layout to check upgrading an existing database.
-	_, err := db.Pool.Exec(ctx, `CREATE INDEX rockets_speed_idx ON rockets(speed,channel);
- CREATE INDEX rockets_mission_idx ON rockets(mission,channel);
- CREATE INDEX rockets_time_idx ON rockets(last_message_time,channel);
- DELETE FROM schema_migrations WHERE version='002_remove_sort_indexes.sql'`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = db.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	assertNoSortIndexes()
-	r := get(t, db, "existing")
-	if r.Speed == nil || *r.Speed != 100 || r.LastApplied != 1 || r.ReceivedCount != 1 {
-		t.Fatalf("migration changed existing state: %+v", r)
-	}
-}

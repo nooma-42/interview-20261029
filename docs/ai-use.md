@@ -18,7 +18,7 @@ Docker was initially unavailable because OrbStack was stopped. It was started wi
 
 ## User-directed simplification
 
-The user asked to stop expanding oversized-string edge cases and simplify the optional tooling. Codex removed the custom load tool, SQL audit and smoke script, their Make/Compose entrypoints, and the duplicate CI unit-test step. A new forward-only migration removes the three optional sort indexes while preserving existing data. Core event, concurrency, persistence and rollback tests remain. Small input guards remain in place; no new boundary scenarios were added.
+The user asked to stop expanding oversized-string edge cases and simplify the optional tooling. Codex removed the custom load tool, SQL audit and smoke script, their Make/Compose entrypoints, and the duplicate CI unit-test step. At the user's request, the initial migration omits the three optional sort indexes; the separate removal migration and its upgrade test were deleted before the initial release. Core event, concurrency, persistence and rollback tests remain. Small input guards remain in place; no new boundary scenarios were added.
 
 ## Human review before submission
 

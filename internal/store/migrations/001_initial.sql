@@ -18,6 +18,3 @@ CREATE TABLE rocket_events (
  payload jsonb NOT NULL,
  PRIMARY KEY (channel, message_number)
 );
-CREATE INDEX rockets_speed_idx ON rockets (speed, channel);
-CREATE INDEX rockets_mission_idx ON rockets (mission, channel);
-CREATE INDEX rockets_time_idx ON rockets (last_message_time, channel);

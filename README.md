@@ -117,7 +117,7 @@ For each ingestion request:
 
 `pendingMessageCount = received_count - last_applied`: contiguous application means exactly `last_applied` unique events have been applied. Events and these counters share the same transaction. Reads cannot see half of a write. Different rockets can progress concurrently; the database serializes writers for the same rocket across all API instances. PostgreSQL's default READ COMMITTED isolation is sufficient with this row lock. An ambiguous commit failure returns `503`; retrying safely resolves whether the commit happened.
 
-There is no queue or worker: a successful HTTP response is already durable, and gap repair happens on ingestion. Migrations use a transaction-scoped advisory lock and version records, so concurrent migration jobs serialize. Apply migrations before serving; migrations are forward-only. Existing migration files must not be edited after deployment. Migration 002 removes the optional sort indexes; sorting uses `ORDER BY` without extra indexes until query volume justifies them.
+There is no queue or worker: a successful HTTP response is already durable, and gap repair happens on ingestion. Migrations use a transaction-scoped advisory lock and version records, so concurrent migration jobs serialize. Apply migrations before serving; migrations are forward-only. Existing migration files must not be edited after deployment. The initial schema keeps only primary-key indexes; sorting uses `ORDER BY` without extra indexes until query volume justifies them.
 
 ## Verification
 
