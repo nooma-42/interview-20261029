@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"rockets/internal/domain"
 	"rockets/internal/store"
@@ -43,7 +44,7 @@ func New(repo Repository, logger *slog.Logger) http.Handler {
 	a.events = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "rocket_events_received_total", Help: "Ingestion requests by durable outcome."}, []string{"outcome"})
 	a.applied = prometheus.NewCounter(prometheus.CounterOpts{Name: "rocket_events_applied_total", Help: "Events applied by this instance after successful commit."})
 	a.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "rocket_http_request_duration_seconds", Help: "HTTP latency by route, method and status.", Buckets: prometheus.DefBuckets}, []string{"route", "method", "status"})
-	reg.MustRegister(a.events, a.applied, a.latency, prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}), &pendingCollector{repo: repo})
+	reg.MustRegister(a.events, a.applied, a.latency, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}), &pendingCollector{repo: repo})
 	a.handle("/messages", http.MethodPost, a.receive)
 	a.handle("/rockets", http.MethodGet, a.list)
 	a.handle("/rockets/{channel}", http.MethodGet, a.get)
