@@ -1,0 +1,33 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: rockets
+          POSTGRES_PASSWORD: rockets
+          POSTGRES_DB: rockets_test
+          POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rockets -d rockets_test"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://rockets:rockets@127.0.0.1:5432/rockets_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod verify
+      - run: test -z "$(gofmt -l cmd internal)"
+      - run: go vet -tags=integration ./...
+      - run: go test -race -tags=integration ./... -count=1
+      - run: docker build -t rockets:ci .

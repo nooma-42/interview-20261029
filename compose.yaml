@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: rockets
+      POSTGRES_PASSWORD: rockets
+      POSTGRES_DB: rockets
+      POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U rockets -d rockets]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  migrate:
+    build: .
+    image: lunar-rockets:local
+    command: [migrate]
+    environment:
+      DATABASE_URL: postgres://rockets:rockets@db:5432/rockets?sslmode=disable
+    depends_on:
+      db:
+        condition: service_healthy
+  api:
+    build: .
+    image: lunar-rockets:local
+    ports:
+      - 127.0.0.1:8088:8088
+      - "[::1]:8088:8088"
+    environment:
+      DATABASE_URL: postgres://rockets:rockets@db:5432/rockets?sslmode=disable
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, /rockets, healthcheck]
+      interval: 5s
+      timeout: 4s
+      retries: 10
+    stop_grace_period: 20s
+    restart: unless-stopped
+volumes:
+  postgres_data:

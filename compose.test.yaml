@@ -1,0 +1,18 @@
+# Isolated temporary database for integration tests.
+services:
+  test-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: rockets
+      POSTGRES_PASSWORD: rockets
+      POSTGRES_DB: rockets_test
+      POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+    ports:
+      - 127.0.0.1:55432:5432
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U rockets -d rockets_test]
+      interval: 1s
+      timeout: 3s
+      retries: 30
