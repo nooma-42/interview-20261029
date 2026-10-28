@@ -23,7 +23,7 @@ go run ./cmd/rockets migrate
 go run ./cmd/rockets serve
 ```
 
-`HTTP_ADDR` defaults to `:8088`. Apply the single `001_initial.sql` migration before starting the API.
+`HTTP_ADDR` defaults to `:8088`. Run `rockets migrate` before starting the API.
 
 ## API
 
@@ -84,6 +84,6 @@ Verified with `go test -race ./...`, `go vet -tags=integration ./...`, and `make
 
 ## Limits
 
-No authentication or event retention policy is included. Missing events can block progress indefinitely; polling and sorting may need indexes at larger scale. Offset pagination can shift during updates.
+No authentication or event retention policy is included. Missing events can block progress indefinitely. Replay uses `(replay_after, channel)` to scan in scheduling order and the events primary key to look up the next message; many channels without their next event can still require scanning many candidates. List sorting may need additional indexes at larger scale. Offset pagination can shift during updates.
 
 Metrics include HTTP latency and received/applied event counters. Applied counters are process-local; database state is authoritative.

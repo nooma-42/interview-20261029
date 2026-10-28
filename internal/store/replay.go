@@ -26,9 +26,8 @@ func (s *Store) ProcessNext(ctx context.Context) (ReplayResult, error) {
 	}
 	defer rollback(tx)
 	// Oldest attempt first gives each runnable channel a turn; gaps never enter the queue.
-	// shortcut: candidate selection scans rockets; add scheduling indexes when fleet size warrants it.
 	r, err := scan(tx.QueryRow(ctx, `SELECT `+columns+` FROM rockets r
- WHERE replay_after <= clock_timestamp()
+ WHERE replay_after <= statement_timestamp()
  AND EXISTS (SELECT 1 FROM rocket_events e WHERE e.channel=r.channel
  AND e.message_number=CASE WHEN r.last_applied<9223372036854775807 THEN r.last_applied+1 END)
  ORDER BY replay_after, channel LIMIT 1 FOR NO KEY UPDATE OF r SKIP LOCKED`))
